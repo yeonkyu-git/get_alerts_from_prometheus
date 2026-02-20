@@ -1,0 +1,13 @@
+{
+  "slack": {
+    "channel": "bsim-server-alerts"
+  },
+  "environments": {
+    "prod": {
+      "prom_url": "http://prometheus-prod.example.com:9090"
+    },
+    "dev_test": {
+      "prom_url": "http://prometheus-dev.example.com:9090"
+    }
+  }
+}
