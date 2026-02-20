@@ -2,3 +2,4 @@
 config.alerts.json
 state/
 *.log
+AGENTS.md

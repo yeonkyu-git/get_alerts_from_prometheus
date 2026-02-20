@@ -4,7 +4,9 @@
   [int] $MinDurationMinutes = 5,
   [int] $ReminderMinutes = 60,
   [string[]] $Environments = @("prod", "dev_test"),
-  [string] $DotEnvPath = (Join-Path $PSScriptRoot ".env")
+  [string] $CodexCommand = "codex",
+  [int] $CodexTimeoutSec = 300,
+  [string] $CodexPrompt = "Prometheus MCP Tool을 사용하여 get_alerts를 하고, 알람이 있는 경우 Slack으로 전송한다."
 )
 
 Set-StrictMode -Version Latest
@@ -40,43 +42,20 @@ function ConvertTo-Hashtable($obj) {
   return $obj
 }
 
-function Import-DotEnv([string] $path) {
-  if (-not (Test-Path -LiteralPath $path)) { return }
-  $lines = Get-Content -LiteralPath $path -Encoding UTF8
-  foreach ($line in $lines) {
-    $lineText = if ($null -eq $line) { "" } else { [string]$line }
-    $trim = $lineText.Trim()
-    if ($trim.Length -eq 0) { continue }
-    if ($trim.StartsWith("#")) { continue }
-    $eq = $trim.IndexOf("=")
-    if ($eq -lt 1) { continue }
-    $key = $trim.Substring(0, $eq).Trim()
-    $val = $trim.Substring($eq + 1).Trim()
-    if (($val.StartsWith('"') -and $val.EndsWith('"')) -or ($val.StartsWith("'") -and $val.EndsWith("'"))) {
-      if ($val.Length -ge 2) { $val = $val.Substring(1, $val.Length - 2) }
-    }
-    if ([string]::IsNullOrWhiteSpace($key)) { continue }
-    if (-not (Test-Path -Path ("Env:" + $key))) {
-      Set-Item -Path ("Env:" + $key) -Value $val
-    }
-  }
-}
-
-function Get-JakartaNow {
-  $tz = [TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
-  return [TimeZoneInfo]::ConvertTime([DateTimeOffset]::UtcNow, $tz)
-}
-
-function Format-Jakarta([DateTimeOffset] $ts) {
-  $tz = [TimeZoneInfo]::FindSystemTimeZoneById("SE Asia Standard Time")
-  $jak = [TimeZoneInfo]::ConvertTime($ts, $tz)
-  $dow = @("일","월","화","수","목","금","토")[[int]$jak.DayOfWeek]
-  return "{0:yyyy-MM-dd}({1}) {0:HH:mm}" -f $jak, $dow
-}
-
 function Parse-DateTimeOffset([string] $value) {
   if ([string]::IsNullOrWhiteSpace($value)) { return $null }
   return [DateTimeOffset]::Parse($value, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal)
+}
+
+function Get-StringHashtableFromPsObject($obj) {
+  $h = @{}
+  if ($null -eq $obj) { return $h }
+  if ($obj.PSObject -and $obj.PSObject.Properties) {
+    foreach ($p in $obj.PSObject.Properties) {
+      $h[$p.Name] = [string]$p.Value
+    }
+  }
+  return $h
 }
 
 function Get-StableFingerprint([string] $environment, [hashtable] $labels) {
@@ -120,86 +99,129 @@ function Write-State([string] $path, $state) {
   $state | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding UTF8
 }
 
-function Slack-PostMessage([string] $token, [string] $channel, [string] $text) {
-  $uri = "https://slack.com/api/chat.postMessage"
-  $body = @{
-    channel = $channel
-    text    = $text
-    mrkdwn  = $true
-  } | ConvertTo-Json -Compress
-
-  $headers = @{
-    "Authorization" = "Bearer $token"
-    "Content-Type"  = "application/json; charset=utf-8"
-  }
-
-  # Windows PowerShell 5.1: send UTF-8 bytes explicitly to avoid mojibake in Slack.
-  $utf8Body = [Text.Encoding]::UTF8.GetBytes($body)
-  $resp = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers -Body $utf8Body -TimeoutSec 20
-  if (-not $resp.ok) {
-    $msg = if ($resp.error) { $resp.error } else { "unknown_error" }
-    throw "Slack API error: $msg"
-  }
-}
-
-function Build-AlertLine(
-  [string] $emoji,
-  [hashtable] $labels,
-  [DateTimeOffset] $activeAtUtc,
-  [DateTimeOffset] $nowUtc,
-  [string] $fp,
-  [bool] $isResolved,
-  $endedAtUtc = $null
+function Invoke-CodexAlertDispatch(
+  [string] $command,
+  [string] $workingDir,
+  [int] $timeoutSec,
+  [string] $basePrompt,
+  [string] $environment,
+  [string] $slackChannel,
+  [string] $promUrl,
+  [int] $firingChanges,
+  [int] $resolvedChanges,
+  [System.Collections.IEnumerable] $firingDetails,
+  [System.Collections.IEnumerable] $resolvedDetails
 ) {
-  $alertname = $labels["alertname"]
-  $serverName = $labels["server_name"]
-  $instance = $labels["instance"]
-  $job = $labels["job"]
-  $severity = $labels["severity"]
-  $severityText = if ($severity) { $severity } else { "unknown" }
-
-  $targetParts = @()
-  if ($serverName) { $targetParts += $serverName }
-  if ($instance) { $targetParts += ("``{0}``" -f $instance) }
-  if ($job) { $targetParts += ("job ``{0}``" -f $job) }
-  $target = if ($targetParts.Count -gt 0) { $targetParts -join " | " } else { "target_unknown" }
-
-  $durMin = [Math]::Floor(($nowUtc - $activeAtUtc).TotalMinutes)
-  if ($durMin -lt 0) { $durMin = 0 }
-
-  if ($isResolved) {
-    $endUtc = if ($null -eq $endedAtUtc) { $nowUtc } else { [DateTimeOffset]$endedAtUtc }
-    $startJak = Format-Jakarta $activeAtUtc
-    $endJak = Format-Jakarta $endUtc
-    $fpCode = ("fp ``{0}``" -f $fp)
-    return "- ✅ *$alertname* | $target | $severityText | ${durMin}분 | $startJak~$endJak | $fpCode"
+  $cmdCandidates = @(Get-Command $command -All -ErrorAction SilentlyContinue)
+  if ($cmdCandidates.Count -eq 0) {
+    throw "Codex command '$command' was not found in PATH."
   }
+  $cmdInfo = $cmdCandidates |
+    Where-Object { $_.Path } |
+    Sort-Object {
+      $ext = [IO.Path]::GetExtension($_.Path).ToLowerInvariant()
+      switch ($ext) {
+        ".exe" { 0; break }
+        ".cmd" { 1; break }
+        ".bat" { 2; break }
+        ".ps1" { 3; break }
+        default { 9; break }
+      }
+    } |
+    Select-Object -First 1
+  if ($null -eq $cmdInfo) {
+    throw "Codex command '$command' did not resolve to an executable path."
+  }
+  $cmdPath = $cmdInfo.Path
 
-  $startJak = Format-Jakarta $activeAtUtc
-  $fpCode = ("fp ``{0}``" -f $fp)
-  return "- $emoji *$alertname* | $target | $severityText | ${durMin}분 | $startJak~현재 | $fpCode"
-}
+  $eventPayload = @{
+    environment = $environment
+    slack_channel = $slackChannel
+    prom_url = $promUrl
+    generated_at_utc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
+    counts = @{
+      firing = $firingChanges
+      resolved = $resolvedChanges
+    }
+    events = @{
+      firing = @($firingDetails)
+      resolved = @($resolvedDetails)
+    }
+  }
+  $eventJson = $eventPayload | ConvertTo-Json -Depth 20
 
-function Severity-Emoji([string] $sev) {
-  switch ($sev) {
-    "critical" { return "🛑" }
-    "warning" { return "⚠️" }
-    default { return "ℹ️" }
+  $prompt = @(
+    $basePrompt
+    "환경: $environment"
+    "Slack 채널: $slackChannel"
+    "사전 감지 변화량: firing ${firingChanges}건, resolved ${resolvedChanges}건"
+    "규칙: 알람이 없으면 Slack 전송을 생략한다."
+    "중요: 아래 JSON의 events.resolved 는 poller가 상태파일 기반으로 계산한 최종 결과다."
+    "중요: resolved 판정은 재계산하지 말고 JSON을 그대로 사용한다."
+    "다음 JSON을 기준으로 Slack 메시지를 작성/전송한다:"
+    $eventJson
+  ) -join "`n"
+
+  $stdoutFile = [IO.Path]::GetTempFileName()
+  $stderrFile = [IO.Path]::GetTempFileName()
+  $lastMsgFile = [IO.Path]::GetTempFileName()
+  $stdinFile = [IO.Path]::GetTempFileName()
+  try {
+    Set-Content -LiteralPath $stdinFile -Value $prompt -Encoding UTF8
+    # Use non-interactive exec and a completion file so we can detect success
+    # even when codex process does not terminate promptly on Windows.
+    $argList = @("exec", "--cd", $workingDir, "--skip-git-repo-check", "--color", "never", "-o", $lastMsgFile, "-")
+    $ext = [IO.Path]::GetExtension($cmdPath).ToLowerInvariant()
+    if ($ext -eq ".ps1") {
+      $proc = Start-Process -FilePath "powershell.exe" -ArgumentList @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $cmdPath) + $argList -NoNewWindow -PassThru -RedirectStandardInput $stdinFile -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+    } else {
+      $proc = Start-Process -FilePath $cmdPath -ArgumentList $argList -NoNewWindow -PassThru -RedirectStandardInput $stdinFile -RedirectStandardOutput $stdoutFile -RedirectStandardError $stderrFile
+    }
+    $startAt = Get-Date
+    $completedByOutput = $false
+    while ($true) {
+      $proc.Refresh()
+      if ($proc.HasExited) { break }
+      if ((Test-Path -LiteralPath $lastMsgFile) -and ((Get-Item -LiteralPath $lastMsgFile).Length -gt 0)) {
+        $completedByOutput = $true
+        break
+      }
+      if (((Get-Date) - $startAt).TotalSeconds -ge $timeoutSec) {
+        $stdout = Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+        $stderr = Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+        try { $proc.Kill() } catch {}
+        throw ("Codex relay timed out after {0} seconds.`nstdout:`n{1}`nstderr:`n{2}" -f $timeoutSec, $stdout, $stderr)
+      }
+      Start-Sleep -Seconds 1
+    }
+    if ($completedByOutput) {
+      if (-not $proc.HasExited) {
+        try { $proc.Kill() } catch {}
+      }
+      return
+    }
+    $proc.Refresh()
+    if ($proc.ExitCode -ne 0) {
+      $stdout = Get-Content -LiteralPath $stdoutFile -Raw -ErrorAction SilentlyContinue
+      $stderr = Get-Content -LiteralPath $stderrFile -Raw -ErrorAction SilentlyContinue
+      throw ("Codex relay failed (exit {0}).`nstdout:`n{1}`nstderr:`n{2}" -f $proc.ExitCode, $stdout, $stderr)
+    }
+  } finally {
+    Remove-Item -LiteralPath $stdoutFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stderrFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $lastMsgFile -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $stdinFile -ErrorAction SilentlyContinue
   }
 }
 
 $config = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $slackChannel = $config.slack.channel
-if ([string]::IsNullOrWhiteSpace($env:SLACK_BOT_TOKEN)) {
-  Import-DotEnv -path $DotEnvPath
-}
-$token = $env:SLACK_BOT_TOKEN
-if ([string]::IsNullOrWhiteSpace($token)) { throw "SLACK_BOT_TOKEN env var is required." }
 if ([string]::IsNullOrWhiteSpace($slackChannel)) { throw "Slack channel is missing in config.alerts.json (slack.channel)." }
 
 $state = Read-State $StatePath
 $nowUtc = [DateTimeOffset]::UtcNow
 
+try {
 foreach ($envKey in $Environments) {
   if ($null -eq $config.environments.$envKey) { throw "Environment '$envKey' not found in config.alerts.json" }
   $promUrl = $config.environments.$envKey.prom_url
@@ -220,10 +242,12 @@ foreach ($envKey in $Environments) {
 
     $labels = @{}
     foreach ($p in $a.labels.PSObject.Properties) { $labels[$p.Name] = [string]$p.Value }
+    $annotations = Get-StringHashtableFromPsObject $a.annotations
     $fp = Get-StableFingerprint -environment $envKey -labels $labels
 
     $currentFiring[$fp] = @{
       labels = $labels
+      annotations = $annotations
       activeAtUtc = $activeAtUtc
       severity = ($labels["severity"] | ForEach-Object { $_.ToLowerInvariant() })
     }
@@ -232,6 +256,8 @@ foreach ($envKey in $Environments) {
 
   $changesFiring = New-Object System.Collections.Generic.List[string]
   $changesResolved = New-Object System.Collections.Generic.List[string]
+  $firingDetails = New-Object System.Collections.Generic.List[object]
+  $resolvedDetails = New-Object System.Collections.Generic.List[object]
 
   foreach ($fp in $eligible) {
     if (-not $state["fingerprints"].ContainsKey($fp)) {
@@ -243,11 +269,13 @@ foreach ($envKey in $Environments) {
         last_sent_resolved_utc = $null
         active_at_utc = $currentFiring[$fp].activeAtUtc.UtcDateTime.ToString("o")
         labels = $currentFiring[$fp].labels
+        annotations = $currentFiring[$fp].annotations
       }
     } else {
       $state["fingerprints"][$fp]["last_seen_utc"] = $nowUtc.UtcDateTime.ToString("o")
       $state["fingerprints"][$fp]["active_at_utc"] = $currentFiring[$fp].activeAtUtc.UtcDateTime.ToString("o")
       $state["fingerprints"][$fp]["labels"] = $currentFiring[$fp].labels
+      $state["fingerprints"][$fp]["annotations"] = $currentFiring[$fp].annotations
     }
 
     $lastSentFiring = Parse-DateTimeOffset $state["fingerprints"][$fp]["last_sent_firing_utc"]
@@ -256,10 +284,32 @@ foreach ($envKey in $Environments) {
     elseif (($nowUtc - $lastSentFiring).TotalMinutes -ge $ReminderMinutes) { $shouldSend = $true }
 
     if ($shouldSend) {
+      $changesFiring.Add($fp)
       $item = $currentFiring[$fp]
-      $emoji = Severity-Emoji $item.severity
-      $changesFiring.Add((Build-AlertLine -emoji $emoji -labels $item.labels -activeAtUtc $item.activeAtUtc -nowUtc $nowUtc -fp $fp -isResolved:$false))
-      $state["fingerprints"][$fp]["last_sent_firing_utc"] = $nowUtc.UtcDateTime.ToString("o")
+      $labels = $item.labels
+      $annotations = $item.annotations
+      $detail = $annotations["description"]
+      if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $annotations["summary"] }
+      if (-not [string]::IsNullOrWhiteSpace($annotations["summary"]) -and -not [string]::IsNullOrWhiteSpace($annotations["description"])) {
+        $detail = "{0} | {1}" -f $annotations["description"], $annotations["summary"]
+      }
+      if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["mountpoint"] }
+      if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["device"] }
+      $firingDetails.Add([ordered]@{
+        status = "firing"
+        fingerprint = $fp
+        env = $envKey
+        alertname = $labels["alertname"]
+        severity = $labels["severity"]
+        server_name = $labels["server_name"]
+        instance = $labels["instance"]
+        job = $labels["job"]
+        detail = $detail
+        active_at_utc = $item.activeAtUtc.UtcDateTime.ToString("o")
+        ended_at_utc = $null
+        labels = $labels
+        annotations = $annotations
+      })
     }
   }
 
@@ -280,15 +330,39 @@ foreach ($envKey in $Environments) {
     $lastSentFiring = Parse-DateTimeOffset $rec.last_sent_firing_utc
     if ($null -eq $lastSentFiring) { continue }
 
+    $changesResolved.Add($fp)
     $labels = @{}
     if ($rec.labels) {
       foreach ($k in $rec.labels.Keys) { $labels[$k] = [string]$rec.labels[$k] }
     }
+    $annotations = @{}
+    if ($rec.annotations) {
+      foreach ($k in $rec.annotations.Keys) { $annotations[$k] = [string]$rec.annotations[$k] }
+    }
     $activeAtUtc = Parse-DateTimeOffset $rec.active_at_utc
     if ($null -eq $activeAtUtc) { $activeAtUtc = $lastSeen }
-    $emoji = Severity-Emoji (($labels["severity"] | ForEach-Object { $_.ToLowerInvariant() }))
-    $changesResolved.Add((Build-AlertLine -emoji $emoji -labels $labels -activeAtUtc $activeAtUtc -nowUtc $nowUtc -fp $fp -isResolved:$true -endedAtUtc $nowUtc))
-    $rec["last_sent_resolved_utc"] = $nowUtc.UtcDateTime.ToString("o")
+    $detail = $annotations["description"]
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $annotations["summary"] }
+    if (-not [string]::IsNullOrWhiteSpace($annotations["summary"]) -and -not [string]::IsNullOrWhiteSpace($annotations["description"])) {
+      $detail = "{0} | {1}" -f $annotations["description"], $annotations["summary"]
+    }
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["mountpoint"] }
+    if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["device"] }
+    $resolvedDetails.Add([ordered]@{
+      status = "resolved"
+      fingerprint = $fp
+      env = $envKey
+      alertname = $labels["alertname"]
+      severity = $labels["severity"]
+      server_name = $labels["server_name"]
+      instance = $labels["instance"]
+      job = $labels["job"]
+      detail = $detail
+      active_at_utc = $activeAtUtc.UtcDateTime.ToString("o")
+      ended_at_utc = $nowUtc.UtcDateTime.ToString("o")
+      labels = $labels
+      annotations = $annotations
+    })
     $state["fingerprints"][$fp] = $rec
   }
 
@@ -296,47 +370,26 @@ foreach ($envKey in $Environments) {
     continue
   }
 
-  # Build summary counts (based on current firing eligible set)
-  $crit = 0
-  $warn = 0
-  foreach ($fp in $eligible) {
-    $sev = $currentFiring[$fp].severity
-    if ($sev -eq "critical") { $crit++ }
-    elseif ($sev -eq "warning") { $warn++ }
+  Invoke-CodexAlertDispatch `
+    -command $CodexCommand `
+    -workingDir $PSScriptRoot `
+    -timeoutSec $CodexTimeoutSec `
+    -basePrompt $CodexPrompt `
+    -environment $envKey `
+    -slackChannel $slackChannel `
+    -promUrl $promUrl `
+    -firingChanges $changesFiring.Count `
+    -resolvedChanges $changesResolved.Count `
+    -firingDetails $firingDetails `
+    -resolvedDetails $resolvedDetails
+
+  foreach ($fp in $changesFiring) {
+    $state["fingerprints"][$fp]["last_sent_firing_utc"] = $nowUtc.UtcDateTime.ToString("o")
   }
-
-  $title = "🚨 알람 알림 | $envKey | $(Format-Jakarta $nowUtc) (Jakarta)"
-
-  $lines = New-Object System.Collections.Generic.List[string]
-  $lines.Add($title)
-  $lines.Add("📌 요약")
-  $lines.Add("- 🛑 Critical $crit" + "건 | ⚠️ Warning $warn" + "건 | 🟢 Resolved " + $changesResolved.Count + "건")
-  $lines.Add("🧾 변경사항")
-
-  if ($changesFiring.Count -gt 0) {
-    $more = if ($changesFiring.Count -gt 3) { " (+ " + ($changesFiring.Count - 3) + "건)" } else { "" }
-    $lines.Add("- 🔴 Firing (신규/리마인드) " + ([Math]::Min(3, $changesFiring.Count)) + "/" + $changesFiring.Count + "건" + $more)
-    $top = $changesFiring | Select-Object -First 3
-    foreach ($l in $top) { $lines.Add("  " + $l) }
-  } else {
-    $lines.Add("- 🔴 Firing (신규/리마인드) 0건")
+  foreach ($fp in $changesResolved) {
+    $state["fingerprints"][$fp]["last_sent_resolved_utc"] = $nowUtc.UtcDateTime.ToString("o")
   }
-
-  if ($changesResolved.Count -gt 0) {
-    $morer = if ($changesResolved.Count -gt 3) { " (+ " + ($changesResolved.Count - 3) + "건)" } else { "" }
-    $lines.Add("- 🟢 Resolved " + ([Math]::Min(3, $changesResolved.Count)) + "/" + $changesResolved.Count + "건" + $morer)
-    $topr = $changesResolved | Select-Object -First 3
-    foreach ($l in $topr) { $lines.Add("  " + $l) }
-  } else {
-    $lines.Add("- 🟢 Resolved 0건")
-  }
-
-  $lines.Add("✅ 다음")
-  $lines.Add("- `up{job=...}`/`up{instance=...}` 로 실제 unreachable 확인")
-  $lines.Add("- 대상 서버의 `9100`(node_exporter) 리슨/프로세스/방화벽 확인")
-
-  $text = ($lines -join "`n")
-  Slack-PostMessage -token $token -channel $slackChannel -text $text
 }
-
-Write-State -path $StatePath -state $state
+} finally {
+  Write-State -path $StatePath -state $state
+}
