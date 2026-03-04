@@ -230,11 +230,12 @@ foreach ($envKey in $Environments) {
   if ($api.status -ne "success") { throw "Prometheus API status != success for $envKey" }
   $alerts = @($api.data.alerts)
 
-  $currentFiring = @{}
+  # Track currently active alerts (both firing and pending)
+  $currentActive = @{}
   $eligible = @()
 
   foreach ($a in $alerts) {
-    if ($a.state -ne "firing") { continue }
+    if ($a.state -ne "firing" -and $a.state -ne "pending") { continue }
     $activeAtUtc = Parse-DateTimeOffset $a.activeAt
     if ($null -eq $activeAtUtc) { continue }
     $durMin = ($nowUtc - $activeAtUtc).TotalMinutes
@@ -245,10 +246,11 @@ foreach ($envKey in $Environments) {
     $annotations = Get-StringHashtableFromPsObject $a.annotations
     $fp = Get-StableFingerprint -environment $envKey -labels $labels
 
-    $currentFiring[$fp] = @{
+    $currentActive[$fp] = @{
       labels = $labels
       annotations = $annotations
       activeAtUtc = $activeAtUtc
+      alertState = [string]$a.state
       severity = ($labels["severity"] | ForEach-Object { $_.ToLowerInvariant() })
     }
     $eligible += $fp
@@ -267,25 +269,29 @@ foreach ($envKey in $Environments) {
         last_seen_utc = $nowUtc.UtcDateTime.ToString("o")
         last_sent_firing_utc = $null
         last_sent_resolved_utc = $null
-        active_at_utc = $currentFiring[$fp].activeAtUtc.UtcDateTime.ToString("o")
-        labels = $currentFiring[$fp].labels
-        annotations = $currentFiring[$fp].annotations
+        last_state = $currentActive[$fp].alertState
+        active_at_utc = $currentActive[$fp].activeAtUtc.UtcDateTime.ToString("o")
+        labels = $currentActive[$fp].labels
+        annotations = $currentActive[$fp].annotations
       }
     } else {
       $state["fingerprints"][$fp]["last_seen_utc"] = $nowUtc.UtcDateTime.ToString("o")
-      $state["fingerprints"][$fp]["active_at_utc"] = $currentFiring[$fp].activeAtUtc.UtcDateTime.ToString("o")
-      $state["fingerprints"][$fp]["labels"] = $currentFiring[$fp].labels
-      $state["fingerprints"][$fp]["annotations"] = $currentFiring[$fp].annotations
+      $state["fingerprints"][$fp]["active_at_utc"] = $currentActive[$fp].activeAtUtc.UtcDateTime.ToString("o")
+      $state["fingerprints"][$fp]["labels"] = $currentActive[$fp].labels
+      $state["fingerprints"][$fp]["annotations"] = $currentActive[$fp].annotations
     }
 
+    $previousState = [string]$state["fingerprints"][$fp]["last_state"]
+    $currentState = [string]$currentActive[$fp].alertState
     $lastSentFiring = Parse-DateTimeOffset $state["fingerprints"][$fp]["last_sent_firing_utc"]
     $shouldSend = $false
     if ($null -eq $lastSentFiring) { $shouldSend = $true }
     elseif (($nowUtc - $lastSentFiring).TotalMinutes -ge $ReminderMinutes) { $shouldSend = $true }
+    elseif ($previousState -eq "pending" -and $currentState -eq "firing") { $shouldSend = $true }
 
     if ($shouldSend) {
       $changesFiring.Add($fp)
-      $item = $currentFiring[$fp]
+      $item = $currentActive[$fp]
       $labels = $item.labels
       $annotations = $item.annotations
       $detail = $annotations["description"]
@@ -311,9 +317,10 @@ foreach ($envKey in $Environments) {
         annotations = $annotations
       })
     }
+    $state["fingerprints"][$fp]["last_state"] = $currentState
   }
 
-  # Resolved detection: previously seen firing fingerprints that are now missing
+  # Resolved detection: previously seen active fingerprints that are now missing
   foreach ($entry in @($state["fingerprints"].GetEnumerator())) {
     $fp = $entry.Key
     $rec = $entry.Value
@@ -321,7 +328,7 @@ foreach ($envKey in $Environments) {
     $lastSeen = Parse-DateTimeOffset $rec.last_seen_utc
     $lastSentResolved = Parse-DateTimeOffset $rec.last_sent_resolved_utc
 
-    if ($currentFiring.ContainsKey($fp)) { continue }
+    if ($currentActive.ContainsKey($fp)) { continue }
     if ($null -eq $lastSeen) { continue }
     if (($nowUtc - $lastSeen).TotalMinutes -lt 4) { continue } # avoid false resolved (scheduler is 5m)
     if ($null -ne $lastSentResolved) { continue } # already announced resolved once
