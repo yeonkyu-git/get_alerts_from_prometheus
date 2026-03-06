@@ -107,8 +107,10 @@ function Invoke-CodexAlertDispatch(
   [string] $environment,
   [string] $slackChannel,
   [string] $promUrl,
+  [int] $pendingChanges,
   [int] $firingChanges,
   [int] $resolvedChanges,
+  [System.Collections.IEnumerable] $pendingDetails,
   [System.Collections.IEnumerable] $firingDetails,
   [System.Collections.IEnumerable] $resolvedDetails
 ) {
@@ -140,10 +142,12 @@ function Invoke-CodexAlertDispatch(
     prom_url = $promUrl
     generated_at_utc = [DateTimeOffset]::UtcNow.UtcDateTime.ToString("o")
     counts = @{
+      pending = $pendingChanges
       firing = $firingChanges
       resolved = $resolvedChanges
     }
     events = @{
+      pending = @($pendingDetails)
       firing = @($firingDetails)
       resolved = @($resolvedDetails)
     }
@@ -154,7 +158,7 @@ function Invoke-CodexAlertDispatch(
     $basePrompt
     "환경: $environment"
     "Slack 채널: $slackChannel"
-    "사전 감지 변화량: firing ${firingChanges}건, resolved ${resolvedChanges}건"
+    "사전 감지 변화량: pending ${pendingChanges}건, firing ${firingChanges}건, resolved ${resolvedChanges}건"
     "규칙: 알람이 없으면 Slack 전송을 생략한다."
     "중요: 아래 JSON의 events.resolved 는 poller가 상태파일 기반으로 계산한 최종 결과다."
     "중요: resolved 판정은 재계산하지 말고 JSON을 그대로 사용한다."
@@ -256,8 +260,10 @@ foreach ($envKey in $Environments) {
     $eligible += $fp
   }
 
+  $changesPending = New-Object System.Collections.Generic.List[string]
   $changesFiring = New-Object System.Collections.Generic.List[string]
   $changesResolved = New-Object System.Collections.Generic.List[string]
+  $pendingDetails = New-Object System.Collections.Generic.List[object]
   $firingDetails = New-Object System.Collections.Generic.List[object]
   $resolvedDetails = New-Object System.Collections.Generic.List[object]
 
@@ -267,6 +273,7 @@ foreach ($envKey in $Environments) {
         env = $envKey
         first_seen_utc = $nowUtc.UtcDateTime.ToString("o")
         last_seen_utc = $nowUtc.UtcDateTime.ToString("o")
+        last_sent_pending_utc = $null
         last_sent_firing_utc = $null
         last_sent_resolved_utc = $null
         last_state = $currentActive[$fp].alertState
@@ -283,14 +290,20 @@ foreach ($envKey in $Environments) {
 
     $previousState = [string]$state["fingerprints"][$fp]["last_state"]
     $currentState = [string]$currentActive[$fp].alertState
-    $lastSentFiring = Parse-DateTimeOffset $state["fingerprints"][$fp]["last_sent_firing_utc"]
     $shouldSend = $false
-    if ($null -eq $lastSentFiring) { $shouldSend = $true }
-    elseif (($nowUtc - $lastSentFiring).TotalMinutes -ge $ReminderMinutes) { $shouldSend = $true }
-    elseif ($previousState -eq "pending" -and $currentState -eq "firing") { $shouldSend = $true }
+    if ($currentState -eq "pending") {
+      $lastSentPending = Parse-DateTimeOffset $state["fingerprints"][$fp]["last_sent_pending_utc"]
+      if ($null -eq $lastSentPending) { $shouldSend = $true }
+      elseif (($nowUtc - $lastSentPending).TotalMinutes -ge $ReminderMinutes) { $shouldSend = $true }
+      elseif ($previousState -eq "firing") { $shouldSend = $true }
+    } elseif ($currentState -eq "firing") {
+      $lastSentFiring = Parse-DateTimeOffset $state["fingerprints"][$fp]["last_sent_firing_utc"]
+      if ($null -eq $lastSentFiring) { $shouldSend = $true }
+      elseif (($nowUtc - $lastSentFiring).TotalMinutes -ge $ReminderMinutes) { $shouldSend = $true }
+      elseif ($previousState -eq "pending") { $shouldSend = $true }
+    }
 
     if ($shouldSend) {
-      $changesFiring.Add($fp)
       $item = $currentActive[$fp]
       $labels = $item.labels
       $annotations = $item.annotations
@@ -301,8 +314,8 @@ foreach ($envKey in $Environments) {
       }
       if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["mountpoint"] }
       if ([string]::IsNullOrWhiteSpace($detail)) { $detail = $labels["device"] }
-      $firingDetails.Add([ordered]@{
-        status = "firing"
+      $event = [ordered]@{
+        status = $currentState
         fingerprint = $fp
         env = $envKey
         alertname = $labels["alertname"]
@@ -315,7 +328,14 @@ foreach ($envKey in $Environments) {
         ended_at_utc = $null
         labels = $labels
         annotations = $annotations
-      })
+      }
+      if ($currentState -eq "pending") {
+        $changesPending.Add($fp)
+        $pendingDetails.Add($event)
+      } else {
+        $changesFiring.Add($fp)
+        $firingDetails.Add($event)
+      }
     }
     $state["fingerprints"][$fp]["last_state"] = $currentState
   }
@@ -333,9 +353,10 @@ foreach ($envKey in $Environments) {
     if (($nowUtc - $lastSeen).TotalMinutes -lt 4) { continue } # avoid false resolved (scheduler is 5m)
     if ($null -ne $lastSentResolved) { continue } # already announced resolved once
 
-    # Only resolve if it had been announced as firing at least once
+    # Resolve if pending or firing had been announced at least once
+    $lastSentPending = Parse-DateTimeOffset $rec.last_sent_pending_utc
     $lastSentFiring = Parse-DateTimeOffset $rec.last_sent_firing_utc
-    if ($null -eq $lastSentFiring) { continue }
+    if ($null -eq $lastSentPending -and $null -eq $lastSentFiring) { continue }
 
     $changesResolved.Add($fp)
     $labels = @{}
@@ -373,7 +394,7 @@ foreach ($envKey in $Environments) {
     $state["fingerprints"][$fp] = $rec
   }
 
-  if ($changesFiring.Count -eq 0 -and $changesResolved.Count -eq 0) {
+  if ($changesPending.Count -eq 0 -and $changesFiring.Count -eq 0 -and $changesResolved.Count -eq 0) {
     continue
   }
 
@@ -385,11 +406,16 @@ foreach ($envKey in $Environments) {
     -environment $envKey `
     -slackChannel $slackChannel `
     -promUrl $promUrl `
+    -pendingChanges $changesPending.Count `
     -firingChanges $changesFiring.Count `
     -resolvedChanges $changesResolved.Count `
+    -pendingDetails $pendingDetails `
     -firingDetails $firingDetails `
     -resolvedDetails $resolvedDetails
 
+  foreach ($fp in $changesPending) {
+    $state["fingerprints"][$fp]["last_sent_pending_utc"] = $nowUtc.UtcDateTime.ToString("o")
+  }
   foreach ($fp in $changesFiring) {
     $state["fingerprints"][$fp]["last_sent_firing_utc"] = $nowUtc.UtcDateTime.ToString("o")
   }
@@ -400,3 +426,4 @@ foreach ($envKey in $Environments) {
 } finally {
   Write-State -path $StatePath -state $state
 }
+

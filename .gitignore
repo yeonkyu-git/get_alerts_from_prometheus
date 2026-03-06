@@ -1,5 +1,23 @@
+﻿# 민감 정보
 .env
+.env.*
+*.env
 config.alerts.json
+config.alerts.local.json
+
+# 상태/로그
 state/
 *.log
-AGENTS.md
+
+# Python
+__pycache__/
+*.pyc
+
+# 키/인증서
+*.pem
+*.key
+*.pfx
+*.crt
+
+# Codex 로컬 설정
+.codex/
